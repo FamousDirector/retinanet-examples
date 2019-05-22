@@ -14,13 +14,20 @@ from pycocotools.coco import COCO
 class COCOPipeline(pipeline.Pipeline):
     'Dali pipeline for COCO'
 
-    def __init__(self, batch_size, num_threads, path, coco, training, annotations, world, device_id, mean, std, resize, max_size):
+    def __init__(self, batch_size, num_threads, path, coco, ids, categories_inv, training, annotations, world, device_id, mean, std, resize, max_size):
         super().__init__(batch_size=batch_size, num_threads=num_threads, device_id = device_id, prefetch_queue_depth=num_threads, seed=42)
 
         self.path = path
         self.training = training
         self.coco = coco
         self.iter = 0
+        self.ids = ids
+        self.categories_inv = categories_inv
+
+        self.input = ops.ExternalSource()
+        self.input_ids = ops.ExternalSource()
+        self.boxes = ops.ExternalSource()
+        self.labels = ops.ExternalSource()
 
         self.reader = ops.COCOReader(annotations_file=annotations, file_root=path, num_shards=world,shard_id=torch.cuda.current_device(), ltrb=True, ratio=True, shuffle_after_epoch=True, save_img_ids=True)
         self.decode_train = ops.nvJPEGDecoderSlice(device="mixed", output_type=types.RGB)
@@ -45,15 +52,25 @@ class COCOPipeline(pipeline.Pipeline):
 
     def define_graph(self):
 
-        images, bboxes, labels, img_ids = self.reader()
+        #images, bboxes, labels, img_ids = self.reader()
+        self.images = self.input()
+        self.image_ids = self.input_ids()
+        self.bboxes = self.boxes()
+        self.labels = self.labels()
+
+        #images = self.images
+        #img_ids = self.image_ids
+        #bboxes = self.bboxes
+        #labels = self.labels
+        
 
         if self.training:
-            crop_begin, crop_size, bboxes, labels = self.bbox_crop(bboxes, labels)
-            images = self.decode_train(images, crop_begin, crop_size)
-            #images=self.decode_infer(images)
-            resize = self.rand4()
-            images, attrs = self.resize_train(images, resize_longer=resize)
-            #images, attrs = self.resize_infer(images)
+            #crop_begin, crop_size, bboxes, labels = self.bbox_crop(self.bboxes, self.labels)
+            #images = self.decode_train(self.images, crop_begin, crop_size)
+            images=self.decode_infer(self.images)
+            #resize = self.rand4()
+            #images, attrs = self.resize_train(images, resize_longer=resize)
+            images, attrs = self.resize_infer(images)
 
             saturation = self.rand1()
             contrast = self.rand1()
@@ -61,19 +78,76 @@ class COCOPipeline(pipeline.Pipeline):
             hue = self.rand3()
             #images = self.twist(images, saturation=saturation, contrast=contrast, brightness=brightness, hue=hue)
 
-            flip = self.coin_flip()
-            bboxes = self.bbox_flip(bboxes, horizontal=flip)
-            images = self.img_flip(images, horizontal=flip)
+            #flip = self.coin_flip()
+            #bboxes = self.bbox_flip(self.bboxes, horizontal=flip)
+            #images = self.img_flip(images, horizontal=flip)
 
 
         else:
-            images = self.decode_infer(images)
+            images = self.decode_infer(self.images)
             images, attrs = self.resize_infer(images)
 
         resized_images = images
         images = self.normalize(self.pad(images))
 
-        return images, bboxes, labels, img_ids, attrs, resized_images
+        return images, self.bboxes, self.labels, self.image_ids, attrs, resized_images
+
+    def iter_setup(self):
+        # Get next COCO images for the batch
+        images, bboxes, labels, ids = [], [], [], []
+        overflow = False
+        for _ in range(self.batch_size):
+            id = int(self.ids[self.iter])
+            file_name = self.coco.loadImgs(id)[0]['file_name']
+            image = open(self.path + file_name, 'rb')
+            bbox, label = self._get_target(id)
+ 
+            images.append(np.frombuffer(image.read(), dtype=np.uint8))
+            ids.append(np.array([-1 if overflow else id], dtype=np.float))
+            bboxes.append(bbox)
+            labels.append(label)           
+
+
+            overflow = self.iter + 1 >= len(self.ids)
+            if not overflow:
+                self.iter = (self.iter + 1) % len(self.ids)
+        self.feed_input(self.images, images)
+        self.feed_input(self.image_ids, ids)
+        self.feed_input(self.bboxes, bboxes)
+        self.feed_input(self.labels, labels)
+
+    def _get_target(self, id):
+        'Get annotations for sample'
+        #print("getting target for {}".format(id))
+        ann_ids = self.coco.getAnnIds(imgIds=id)
+        annotations = self.coco.loadAnns(ann_ids)
+        dims = self.coco.loadImgs(id)[0]
+        w, h = float(dims['width']), float(dims['height'])
+        boxes, categories = [], []
+        for ann in annotations:
+            if ann['bbox'][2] < 1 and ann['bbox'][3] < 1:
+                continue
+            boxes.append(ann['bbox'])
+            cat = ann['category_id']
+            if 'categories' in self.coco.dataset:
+                cat = self.categories_inv[cat]
+            categories.append(cat)
+
+        if boxes:
+            np_bboxes = np.array(boxes, dtype=np.double)
+            np_bboxes[:, 0] /= w
+            np_bboxes[:, 2] /= w
+            np_bboxes[:, 1] /= h
+            np_bboxes[:, 3] /= h
+
+            np_bboxes[:, 2] += np_bboxes[:,0]
+            np_bboxes[:, 3] += np_bboxes[:,1]
+            np_labels = np.array(categories, dtype=np.int32)
+            #print([x.shape for x in [np_bboxes, np_labels]])
+        else:
+            np_bboxes = np.empty(shape=[1,4], dtype=np.double) 
+            np_labels = -1* np.ones(shape=[1,], dtype=np.int32)
+        return np_bboxes, np_labels
 
 
 class DaliDataIterator():
@@ -93,12 +167,14 @@ class DaliDataIterator():
         # Setup COCO
         with redirect_stdout(None):
             self.coco = COCO(annotations)
-        self.ids = list(self.coco.imgs.keys())
+        self.ids = sorted(list(self.coco.imgs.keys()))
+        self.local_ids = np.array_split(np.array(self.ids), world)[torch.cuda.current_device()]
+
         if 'categories' in self.coco.dataset:
             self.categories_inv = { k: i for i, k in enumerate(self.coco.getCatIds()) }
 
         self.pipe = COCOPipeline(batch_size=self.batch_size, num_threads=2, 
-            path=path, coco=self.coco, training=training, annotations=annotations, world=world, device_id = torch.cuda.current_device(), mean=self.mean, std=self.std, resize=resize, max_size=max_size)
+            path=path, coco=self.coco, ids=self.local_ids, categories_inv = self.categories_inv, training=training, annotations=annotations, world=world, device_id = torch.cuda.current_device(), mean=self.mean, std=self.std, resize=resize, max_size=max_size)
 
         self.pipe.build()
 
@@ -109,14 +185,14 @@ class DaliDataIterator():
         ])
 
     def __len__(self):
-        return ceil(len(self.ids) // self.world / self.batch_size)
+        return ceil(len(self.local_ids) / self.batch_size)
 
     def __iter__(self):
         for _ in range(self.__len__()):
-
+            #print("about to run pipe")
             data, ratios, ids, num_detections = [], [], [], []
             dali_data, dali_boxes, dali_labels, dali_ids, dali_attrs, dali_resize_img = self.pipe.run()
-
+           # print("got pipe outputs")
             for l in range(len(dali_boxes)):
                 num_detections.append(dali_boxes.at(l).shape[0])
 
